@@ -117,6 +117,7 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.block_size = config.block_size
+        self.enable_decoder = False
 
         type_given = config.model_type is not None
         params_given = all([config.n_layer is not None, config.n_head is not None, config.n_embd is not None])
@@ -132,6 +133,7 @@ class GPT(nn.Module):
                 'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
                 'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
                 'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+                'gpt-neo':      dict(n_layer=12, n_head=12, n_embd=768),  # 
                 # Gophers
                 'gopher-44m':   dict(n_layer=8, n_head=16, n_embd=512),
                 # (there are a number more...)
@@ -148,6 +150,12 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
+
+        self.decoder = nn.ModuleDict(dict(
+            drop = nn.Dropout(config.embd_pdrop),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embd),
+        ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
@@ -157,7 +165,8 @@ class GPT(nn.Module):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters (note we don't count the decoder parameters in lm_head)
-        n_params = sum(p.numel() for p in self.transformer.parameters())
+        n_params = sum(p.numel() for p in self.transformer.parameters()) + \
+            sum(p.numel() for p in self.decoder.parameters())
         print("number of parameters: %.2fM" % (n_params/1e6,))
 
     def _init_weights(self, module):
@@ -177,7 +186,7 @@ class GPT(nn.Module):
         Initialize a pretrained GPT model by copying over the weights
         from a huggingface/transformers checkpoint.
         """
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        assert model_type in {'gpt2', 'gpt-neo', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         from transformers import GPT2LMHeadModel
 
         # create a from-scratch initialized minGPT model
@@ -187,7 +196,9 @@ class GPT(nn.Module):
         config.block_size = 1024  # openai's model block_size
         model = GPT(config)
         sd = model.state_dict()
-
+        
+        if model_type in 'gpt_neo':
+            config.model_type = 'EleutherAI/gpt-neo-125M'
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
@@ -197,7 +208,8 @@ class GPT(nn.Module):
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla nn.Linear.
         # this means that we have to transpose these weights when we import them
-        assert len(keys) == len(sd)
+        keys_sd = [k for k in sd if "decoder" not in k]
+        assert len(keys) == len(keys_sd)
         for k in keys:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
@@ -256,7 +268,12 @@ class GPT(nn.Module):
         ]
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
-
+    
+    def freeze_encoder(self):
+        for name, param in self.named_parameters():
+            if "transformer" in name:
+                param.requires_grad = False
+        
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
@@ -270,6 +287,11 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
+        if self.enable_decoder:
+            x = self.decoder.drop(x)
+            for block in self.decoder.h:
+                x = block(x)
+            x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
         # if we are given some desired targets also calculate the loss
